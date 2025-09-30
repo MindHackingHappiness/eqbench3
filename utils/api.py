@@ -20,6 +20,14 @@ except ImportError:
     CORE_AVAILABLE = False
     logging.warning("CORE engine not available, falling back to direct API calls")
 
+# Import admin override system
+try:
+    from .admin_override import AdminOverrideManager, BatchManager
+    ADMIN_OVERRIDE_AVAILABLE = True
+except ImportError:
+    ADMIN_OVERRIDE_AVAILABLE = False
+    logging.warning("Admin override system not available")
+
 load_dotenv()
 
 class APIClient:
@@ -48,6 +56,17 @@ class APIClient:
             self.core_engine = Engine(cfg)
             self.cache_index = CacheIndex("logs/eqbench3_cache.sqlite")
             self.payload_cache = {}  # In-memory cache for payload deduplication
+
+            # Initialize admin override system
+            if ADMIN_OVERRIDE_AVAILABLE:
+                self.admin_manager = AdminOverrideManager()
+                self.batch_manager = BatchManager()
+                logging.info("Admin override system enabled for cost control")
+            else:
+                self.admin_manager = None
+                self.batch_manager = None
+                logging.warning("Admin override system not available")
+
             logging.info(f"Initialized {self.model_type} API client with CORE engine")
         else:
             # Fallback to direct API calls
@@ -97,6 +116,18 @@ class APIClient:
             try:
                 # Convert model name for CORE engine (handle different naming conventions)
                 core_model = self._convert_model_name(model)
+
+                # Admin override check for expensive operations
+                estimated_tokens = self._estimate_payload_tokens(messages, core_model)
+                if (self.admin_manager and
+                    not self.admin_manager.check_override_for_large_payload(core_model, estimated_tokens, f"eqbench3_{self.model_type}")):
+                    logging.warning(f"Admin override denied for {core_model} with {estimated_tokens} estimated tokens")
+                    # Fall through to OpenAI fallback instead
+                    raise Exception("Admin override required - falling back to OpenAI")
+
+                # Log the operation for audit
+                if self.admin_manager:
+                    self.admin_manager.log_operation(core_model, estimated_tokens, f"eqbench3_{self.model_type}", True)
 
                 # Call CORE engine
                 result = self.core_engine.acomplete(
@@ -193,6 +224,22 @@ class APIClient:
             return model.replace("openai/", "")
         # Add more mappings as needed
         return model
+
+    def _estimate_payload_tokens(self, messages: List[Dict[str, str]], model: str) -> int:
+        """Estimate token count for payload before making API call."""
+        if hasattr(self, 'core_engine'):
+            try:
+                # Use CORE engine's estimation for consistency
+                from core_gemini.caching import openai_messages_to_rest_contents, estimate_tokens
+                contents = openai_messages_to_rest_contents(messages)
+                estimated = estimate_tokens(self.core_engine.cfg, model=model, contents=contents)
+                return estimated or 1000  # fallback estimate
+            except Exception:
+                pass
+
+        # Fallback: rough character-based estimation (very approximate)
+        total_chars = sum(len(str(msg.get('content', ''))) for msg in messages)
+        return total_chars // 3  # Very rough approximation
 
     def _clean_response(self, content: str) -> str:
         """Clean response content by stripping thinking/reasoning blocks."""
