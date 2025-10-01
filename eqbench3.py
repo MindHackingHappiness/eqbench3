@@ -18,10 +18,10 @@ import unicodedata
 from dotenv import load_dotenv
 load_dotenv()
 
-from utils.logging_setup import setup_logging, get_verbosity
-from utils.file_io import load_json_file, update_run_data, save_json_file # save_json_file needed for reset
-from core.benchmark import run_eq_bench3 # Import the main benchmark runner
-import utils.constants as C # Import constants for default file paths
+from .utils.logging_setup import setup_logging, get_verbosity
+from .utils.file_io import load_json_file, update_run_data, save_json_file # save_json_file needed for reset
+from .core.benchmark import run_eq_bench3 # Import the main benchmark runner
+from .utils import constants as C # Import constants for default file paths
 
 
 def signal_handler(signum, frame):
@@ -86,8 +86,7 @@ def print_summary_box(run_key: str, local_runs_file: str, run_elo: bool, run_rub
             rubric_score_100_str = f"{rubric_score_0_100:.2f}" # Format the 0-100 score
         else:
             # Handle cases where score might be "N/A" or other non-numeric string
-             rubric_score_100_str = str(rubric_score_0_20)
-
+            rubric_score_100_str = str(rubric_score_0_20)
 
         # --- ELO Score ---
         elo_raw = results.get("elo_raw", "N/A")
@@ -106,8 +105,6 @@ def print_summary_box(run_key: str, local_runs_file: str, run_elo: bool, run_rub
             elo_raw_str = f"{elo_raw:.2f}" if isinstance(elo_raw, (int, float)) else str(elo_raw)
             elo_norm_str = f"{elo_norm:.2f}" if isinstance(elo_norm, (int, float)) else str(elo_norm)
 
-        import unicodedata
-
         # ──────────  helper: printable width  ──────────
         def cell_width(s: str) -> int:
             """Return the on‑screen width of s in monospaced fonts."""
@@ -123,11 +120,13 @@ def print_summary_box(run_key: str, local_runs_file: str, run_elo: bool, run_rub
                 return s + " " * (max_w - cell_width(s))
             keep_w = max_w - cell_width(ellipsis)
             out = ""
+            cur_w = 0
             for ch in s:
                 ch_w = 2 if unicodedata.east_asian_width(ch) in ("F", "W") else 1
-                if cell_width(out) + ch_w > keep_w:
+                if cur_w + ch_w > keep_w:
                     break
                 out += ch
+                cur_w += ch_w
             return out + ellipsis
 
         # ──────────  box parameters  ──────────
@@ -181,14 +180,15 @@ def print_summary_box(run_key: str, local_runs_file: str, run_elo: bool, run_rub
         print("\n" + TOP)
         print(make_row("", "EQBench3 Results Summary".center(value_col)))
         print(TITLE_SEP)
-        for (lbl, val) in rows:
+        for i, (lbl, val) in enumerate(rows):
             if lbl == "Duration:":
                 print(ROW_SEP)
+            print(make_row(lbl, str(val)))
+            # Insert ELO header AFTER Rubric row
             if lbl == "Rubric Score (0‑100):":
                 print(ROW_SEP)
                 print(make_row("", "ELO Analysis Results".center(value_col)))
                 print(ROW_SEP)
-            print(make_row(lbl, str(val)))
         print(BOTTOM)
 
 
@@ -571,7 +571,7 @@ def main():
 
     if (run_elo_flag or run_rubric_flag) and not args.judge_model:
         parser.error("--judge-model is required unless both --no-elo and --no-rubric are specified.")
-        sys.exit(1)
+        # parser.error already exits, no need for additional sys.exit(1)
 
     # Hook signals for graceful shutdown
     signal.signal(signal.SIGINT, signal_handler)

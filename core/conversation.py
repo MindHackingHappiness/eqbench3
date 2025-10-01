@@ -9,7 +9,7 @@ import re
 import json # For parsing rubric scores
 from typing import Dict, Any, List, Optional, Tuple
 import queue
-from utils.constants import (
+from ..utils.constants import (
     NO_RP_SCENARIO_IDS,
     MESSAGE_DRAFTING_SCENARIO_IDS,
     ANALYSIS_SCENARIO_IDS, # Added
@@ -19,7 +19,7 @@ from utils.constants import (
     DEBRIEF_CHAR_LIMIT,
     ANALYSIS_RESPONSE_CHAR_LIMIT
 )
-from utils.utils import robust_json_loads
+from ..utils.utils import robust_json_loads
 
 class ScenarioTask:
     """

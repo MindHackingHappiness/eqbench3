@@ -95,7 +95,7 @@ class APIClient:
 
             logging.debug(f"Initialized {self.model_type} API client with URL: {self.base_url}")
 
-    def generate(self, model: str, messages: List[Dict[str, str]], temperature: float = 0.7, max_tokens: int = 4000, min_p: Optional[float] = 0.1) -> str:
+    async def agenerate(self, model: str, messages: List[Dict[str, str]], temperature: float = 0.7, max_tokens: int = 4000, min_p: Optional[float] = 0.1) -> str:
         """
         Generic chat-completion style call using a list of messages.
         Uses CORE engine with caching when available to avoid repeating identical payloads.
@@ -130,7 +130,7 @@ class APIClient:
                     self.admin_manager.log_operation(core_model, estimated_tokens, f"eqbench3_{self.model_type}", True)
 
                 # Call CORE engine
-                result = self.core_engine.acomplete(
+                result = await self.core_engine.acomplete(
                     messages=messages,
                     model=core_model,
                     temperature=temperature,
@@ -214,6 +214,18 @@ class APIClient:
                 time.sleep(self.retry_delay * (attempt + 1))
 
         raise RuntimeError(f"Failed to generate text for model {model} after {self.max_retries} attempts")
+
+    def generate(self, model: str, messages: List[Dict[str, str]], temperature: float = 0.7, max_tokens: int = 4000, min_p: Optional[float] = 0.1) -> str:
+        """
+        Sync wrapper for CLI usage.
+        """
+        import asyncio
+        try:
+            asyncio.get_running_loop()
+            raise RuntimeError("generate() called inside running loop; use await agenerate() instead")
+        except RuntimeError:
+            pass  # no loop running, safe to use asyncio.run
+        return asyncio.run(self.agenerate(model, messages, temperature, max_tokens, min_p))
 
     def _convert_model_name(self, model: str) -> str:
         """Convert model names between different APIs."""

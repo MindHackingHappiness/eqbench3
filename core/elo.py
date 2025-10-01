@@ -12,8 +12,8 @@ from collections import defaultdict
 from pathlib import Path
 import copy # For deep copying ELO data before modification
 
-from utils.file_io import load_json_file, save_json_file
-from utils.constants import (
+from ..utils.file_io import load_json_file, save_json_file
+from ..utils.constants import (
     ANALYSIS_SCENARIO_IDS, # Used directly
     STANDARD_PAIRWISE_PROMPT_FILE, # Used directly
     ANALYSIS_PAIRWISE_PROMPT_FILE, # Used directly

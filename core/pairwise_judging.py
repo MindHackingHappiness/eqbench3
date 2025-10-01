@@ -11,8 +11,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import defaultdict
 from tqdm import tqdm
 
-from utils.utils import robust_json_loads
-from utils.constants import ANALYSIS_SCENARIO_IDS, DEBRIEF_CHAR_LIMIT, ANALYSIS_RESPONSE_CHAR_LIMIT
+from ..utils.utils import robust_json_loads
+from ..utils.constants import ANALYSIS_SCENARIO_IDS, DEBRIEF_CHAR_LIMIT, ANALYSIS_RESPONSE_CHAR_LIMIT
 from .elo_config import (
     CONVERSATION_HISTORY_TRUNCATION_TOKENS,
     MAX_POSSIBLE_DIFF,

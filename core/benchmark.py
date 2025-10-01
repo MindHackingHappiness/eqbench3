@@ -18,12 +18,12 @@ import threading
 import statistics # For averaging rubric scores
 from pathlib import Path
 
-from utils.file_io import load_json_file, update_run_data, save_json_file
-from utils.api import APIClient
-from core.conversation import ScenarioTask
-from core.elo import run_elo_analysis_eqbench3 # Keep existing import
+from ..utils.file_io import load_json_file, update_run_data, save_json_file
+from ..utils.api import APIClient
+from .conversation import ScenarioTask
+from .elo import run_elo_analysis_eqbench3 # Keep existing import
 # Import constants including file paths and scenario type IDs
-import utils.constants as C
+import eqbench3.utils.constants as C
 from collections import defaultdict
 
 ALLOW_INCOMPLETE_RESPONSES = True

@@ -43,7 +43,7 @@ DEBRIEF_CHAR_LIMIT = 4000 # Used for standard/drafting debriefs
 ANALYSIS_RESPONSE_CHAR_LIMIT = 6000
 
 # --- Hardcoded File Paths ---
-DATA_DIR = "data"
+DATA_DIR = "eqbench3/data"
 # Standard Task Files
 STANDARD_SCENARIO_PROMPTS_FILE = os.path.join(DATA_DIR, "scenario_prompts.txt")
 STANDARD_MASTER_PROMPT_FILE = os.path.join(DATA_DIR, "scenario_master_prompt.txt")

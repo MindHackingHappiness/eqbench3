@@ -5,7 +5,7 @@ import statistics
 from typing import Dict, Any, List, Tuple, Optional, Set
 
 # Assuming constants are imported from a central location or defined elsewhere if needed
-from utils.constants import (
+from ..utils.constants import (
     NO_RP_SCENARIO_IDS,
     MESSAGE_DRAFTING_SCENARIO_IDS,
     ANALYSIS_SCENARIO_IDS,
