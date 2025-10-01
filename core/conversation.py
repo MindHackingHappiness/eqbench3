@@ -47,6 +47,52 @@ class ScenarioTask:
         self.model_name = test_model # Store the logical name internally
         self.master_prompt_template = master_prompt_template
 
+        # Load superprompt from .cache if available
+        self.superprompt = self._load_superprompt()
+
+        # Status Lifecycle:
+        # Standard/Drafting: initialized -> running_scenario -> scenario_completed -> running_debrief -> completed -> [running_rubric_scoring -> rubric_scored]
+        # Analysis:          initialized -> running_scenario -> scenario_completed -> [running_rubric_scoring -> rubric_scored]
+        # Any step can transition to 'error'.
+        self.status = "initialized"
+        self.start_time = None
+        self.end_time = None # Marks end of the *entire* task processing (incl. rubric)
+        self.error = None # General error message if any step fails
+
+        # Scenario Phase Data
+        self.conversation_history: List[Dict[str, str]] = []
+        self.parsed_responses: List[Dict[str, str]] = [] # Stores parsed sections or just {"raw": ...} for NO_RP/ANALYSIS
+        self.scenario_run_error: Optional[str] = None
+
+        # Debrief Phase Data (Only for non-analysis tasks)
+        self.debrief_response: Optional[str] = None
+        self.debrief_run_error: Optional[str] = None
+
+        # Rubric Scoring Phase Data
+        self.rubric_scores: Optional[Dict[str, float]] = None
+        self.raw_rubric_judge_text: Optional[str] = None
+        self.rubric_run_error: Optional[str] = None
+
+    @staticmethod
+    def _load_superprompt():
+        """Load superprompt from .cache/superprompt.txt if it exists."""
+        superprompt_path = ".cache/superprompt.txt"
+        try:
+            with open(superprompt_path, 'r', encoding='utf-8') as f:
+                content = f.read().strip()
+                if content:
+                    logging.info(f"Loaded superprompt from {superprompt_path} ({len(content)} chars)")
+                    return content + "\n\n"
+                else:
+                    logging.debug(f"Superprompt file {superprompt_path} exists but is empty")
+                    return ""
+        except FileNotFoundError:
+            logging.debug(f"No superprompt found at {superprompt_path}")
+            return ""
+        except Exception as e:
+            logging.warning(f"Error loading superprompt from {superprompt_path}: {e}")
+            return ""
+
         # Status Lifecycle:
         # Standard/Drafting: initialized -> running_scenario -> scenario_completed -> running_debrief -> completed -> [running_rubric_scoring -> rubric_scored]
         # Analysis:          initialized -> running_scenario -> scenario_completed -> [running_rubric_scoring -> rubric_scored]
@@ -236,6 +282,10 @@ class ScenarioTask:
                 else:
                     # Fallback for NO_RP or if template is missing (shouldn't happen for analysis/drafting now)
                     formatted_prompt = user_prompt # Maybe add word count hint here too?
+
+                # Prepend superprompt at the very first layer of user instructions
+                if self.superprompt:
+                    formatted_prompt = self.superprompt + formatted_prompt
 
                 # Add user prompt to history
                 if not current_messages or current_messages[-1]["role"] == "assistant":

@@ -79,7 +79,7 @@ MODEL_NAME_SUBS = {
     'openai/gpt-4.5-preview': 'gpt-4.5-preview',
     'cohere/command-a': 'CohereForAI/c4ai-command-a-03-2025',
     'anthropic/claude-3.5-haiku': 'claude-3-5-haiku-20241022',
-    'google/gemini-2.0-flash-001': 'gemini-2.0-flash-001',
+    'google/gemini-2.0-flash-001': 'gemini-2.0-flash',
     'openai/gpt-4o-mini': 'gpt-4o-mini',
     'mistralai/mistral-nemo': 'mistralai/Mistral-Nemo-Instruct-2407',
     'mistralai/mistral-small-3.1-24b-instruct': 'mistralai/Mistral-Small-3.1-24B-Instruct-2503',
@@ -99,6 +99,7 @@ MODEL_NAME_SUBS = {
     'openai/gpt-4.1': 'gpt-4.1',
     'openai/gpt-4.1-nano': 'gpt-4.1-nano',
     'google/gemini-2.5-flash-preview': 'gemini-2.5-flash-preview',
+    'google/gemini-2.5-pro': 'gemini-2.5-pro',
     'anthropic/claude-opus-4': 'claude-opus-4',
     'mistralai/mistral-small-3.2-24b-instruct': 'mistralai/Mistral-Small-3.2-24B-Instruct-2506',
 }
