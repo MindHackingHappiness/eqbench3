@@ -95,15 +95,15 @@ class APIClient:
 
             logging.debug(f"Initialized {self.model_type} API client with URL: {self.base_url}")
 
-    async def agenerate(self, model: str, messages: List[Dict[str, str]], temperature: float = 0.7, max_tokens: int = 4000, min_p: Optional[float] = 0.1) -> str:
+    async def agenerate(self, model: str, messages: List[Dict[str, str]], temperature: float = 0.7, max_tokens: int = 4000, min_p: Optional[float] = 0.1, system_instruction_text: Optional[str] = None) -> str:
         """
         Generic chat-completion style call using a list of messages.
         Uses CORE engine with caching when available to avoid repeating identical payloads.
         Falls back to direct API calls if CORE is not available.
         """
-        # Create cache key from model and messages to avoid repeating identical requests
+        # Create cache key from model, messages, and system_instruction to avoid repeating identical requests
         cache_key = hashlib.sha256(
-            json.dumps({"model": model, "messages": messages, "temperature": temperature, "max_tokens": max_tokens}, sort_keys=True).encode()
+            json.dumps({"model": model, "messages": messages, "system_instruction": system_instruction_text or "", "temperature": temperature, "max_tokens": max_tokens}, sort_keys=True).encode()
         ).hexdigest()
 
         # Check in-memory cache first
@@ -135,6 +135,7 @@ class APIClient:
                     model=core_model,
                     temperature=temperature,
                     max_tokens=max_tokens,
+                    system_instruction_text=system_instruction_text,
                     metadata={"eqbench3_model_type": self.model_type}
                 )
 
@@ -173,6 +174,10 @@ class APIClient:
                     logging.debug(f"Applying min_p={min_p} for test model call.")
                 elif self.model_type == "judge":
                     pass  # Don't add min_p for judge
+
+                # Add system instruction to messages for direct API calls
+                if system_instruction_text:
+                    payload['messages'].insert(0, {"role": "system", "content": system_instruction_text})
 
                 # Handle different API endpoints and model-specific requirements
                 self._adjust_payload_for_endpoint(payload, model)
@@ -215,7 +220,7 @@ class APIClient:
 
         raise RuntimeError(f"Failed to generate text for model {model} after {self.max_retries} attempts")
 
-    def generate(self, model: str, messages: List[Dict[str, str]], temperature: float = 0.7, max_tokens: int = 4000, min_p: Optional[float] = 0.1) -> str:
+    def generate(self, model: str, messages: List[Dict[str, str]], temperature: float = 0.7, max_tokens: int = 4000, min_p: Optional[float] = 0.1, system_instruction_text: Optional[str] = None) -> str:
         """
         Sync wrapper for CLI usage.
         """
@@ -225,7 +230,7 @@ class APIClient:
             raise RuntimeError("generate() called inside running loop; use await agenerate() instead")
         except RuntimeError:
             pass  # no loop running, safe to use asyncio.run
-        return asyncio.run(self.agenerate(model, messages, temperature, max_tokens, min_p))
+        return asyncio.run(self.agenerate(model, messages, temperature, max_tokens, min_p, system_instruction_text))
 
     def _convert_model_name(self, model: str) -> str:
         """Convert model names between different APIs."""

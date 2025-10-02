@@ -283,9 +283,7 @@ class ScenarioTask:
                     # Fallback for NO_RP or if template is missing (shouldn't happen for analysis/drafting now)
                     formatted_prompt = user_prompt # Maybe add word count hint here too?
 
-                # Prepend superprompt at the very first layer of user instructions
-                if self.superprompt:
-                    formatted_prompt = self.superprompt + formatted_prompt
+                # Note: superprompt is now passed as system_instruction_text below, not prepended here
 
                 # Add user prompt to history
                 if not current_messages or current_messages[-1]["role"] == "assistant":
@@ -308,7 +306,8 @@ class ScenarioTask:
                     messages=current_messages,
                     temperature=0.7, # Consider different temps per type?
                     max_tokens=12000, # Consider different lengths per type?
-                    min_p=0.1
+                    min_p=0.1,
+                    system_instruction_text=self.superprompt if self.superprompt else None
                     )
 
                 # Store response: Parse for standard/drafting, store raw for NO_RP/Analysis
@@ -420,7 +419,8 @@ class ScenarioTask:
                 messages=debrief_messages,
                 temperature=0.5,
                 max_tokens=12000,
-                min_p=None
+                min_p=None,
+                system_instruction_text=self.superprompt if self.superprompt else None
             )
             self.debrief_response = response.strip()
             self.status = "completed" # Final status before optional rubric step

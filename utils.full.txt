@@ -1,0 +1,919 @@
+"""Admin override system for EQBench3 expensive operations."""
+import os
+import logging
+import getpass
+from typing import Optional
+
+class AdminOverrideManager:
+    """Manages admin overrides for expensive EQBench3 operations."""
+
+    def __init__(self):
+        self.override_key = os.getenv("EQBENCH_ADMIN_OVERRIDE", "0")
+        self.max_tokens_per_batch = int(os.getenv("EQBENCH_MAX_TOKENS_PER_BATCH", "30000"))
+        self.allow_expensive_models = os.getenv("EQBENCH_ALLOW_EXPENSIVE_MODELS", "0").lower() == "1"
+        self.require_confirmation = not self.allow_expensive_models
+
+    def check_override_for_large_payload(self, model: str, estimated_tokens: int, operation: str = "evaluation") -> bool:
+        """
+        Check if admin override is required for large payloads.
+        Returns True if operation is allowed, False if rejected.
+        """
+        # Automatic approval for cheap models
+        if "1.5-flash" in model:
+            return True
+
+        # Automatic rejection for very expensive combinations
+        if estimated_tokens > 75000 and ("2.5" in model or "2.0" in model):
+            logging.warning(f"REJECTED: {operation} with {model} would cost ~${estimated_tokens/1000000*15:.2f}")
+            return False
+
+        # Require override for expensive combinations
+        if estimated_tokens > self.max_tokens_per_batch or ("2.5" in model and estimated_tokens > 20000):
+            return self._get_admin_approval(model, estimated_tokens, operation)
+
+        return True
+
+    def _get_admin_approval(self, model: str, estimated_tokens: int, operation: str) -> bool:
+        """Get admin approval for expensive operation."""
+        if self.override_key == "1":
+            logging.info(f"ADMIN OVERRIDE: Auto-approved {operation} with {model} ({estimated_tokens} tokens)")
+            return True
+
+        try:
+            estimated_cost = (estimated_tokens / 1000000) * 30  # Rough estimate for expensive models
+
+            print(f"\n{'='*60}")
+            print("⚠️  EXPENSIVE OPERATION REQUIRES APPROVAL")
+            print(f"{'='*60}")
+            print(f"Operation: {operation}")
+            print(f"Model: {model}")
+            print(f"Estimated tokens: {estimated_tokens:,}")
+            print(f"Estimated cost: ${estimated_cost:.2f}")
+            print(f"{'='*60}")
+
+            response = input("Allow this operation? (yes/no): ").strip().lower()
+
+            if response in ["yes", "y"]:
+                logging.info(f"ADMIN APPROVED: {operation} with {model} ({estimated_tokens} tokens)")
+                return True
+            else:
+                logging.info(f"ADMIN REJECTED: {operation} with {model} ({estimated_tokens} tokens)")
+                return False
+
+        except KeyboardInterrupt:
+            logging.info("Operation cancelled by user")
+            return False
+        except Exception as e:
+            logging.error(f"Admin approval failed: {e}")
+            return False
+
+    def log_operation(self, model: str, estimated_tokens: int, operation: str, approved: bool):
+        """Log all override decisions for audit trail."""
+        status = "APPROVED" if approved else "REJECTED"
+        logging.info(f"EQBENCH_ADMIN_CHECK: {status} | {operation} | {model} | {estimated_tokens} tokens")
+
+class BatchManager:
+    """Manages batch sizes and payload limits."""
+
+    def __init__(self):
+        self.max_batch_size = int(os.getenv("EQBENCH_MAX_BATCH_SIZE", "30"))
+        self.max_tokens_total = int(os.getenv("EQBENCH_MAX_TOTAL_TOKENS", "100000"))
+
+    def enforce_batch_limits(self, batch_size: int, model: str) -> int:
+        """Enforce batch size limits based on model."""
+        if "2.5" in model and batch_size > 10:
+            logging.warning(f"Reducing batch size from {batch_size} to 10 for expensive model {model}")
+            return 10
+        elif batch_size > self.max_batch_size:
+            logging.warning(f"Reducing batch size from {batch_size} to {self.max_batch_size}")
+            return self.max_batch_size
+        return batch_size
+import os
+import time
+import logging
+import json
+import requests
+import random
+import string
+import hashlib
+from typing import Optional, Dict, Any, List # Added List
+from dotenv import load_dotenv
+
+# Import CORE engine for caching integration
+try:
+    import sys
+    sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
+    from core_gemini import Engine, EngineConfig
+    from core_gemini.persistence.cache_index import CacheIndex
+    CORE_AVAILABLE = True
+except ImportError:
+    CORE_AVAILABLE = False
+    logging.warning("CORE engine not available, falling back to direct API calls")
+
+# Import admin override system
+try:
+    from .admin_override import AdminOverrideManager, BatchManager
+    ADMIN_OVERRIDE_AVAILABLE = True
+except ImportError:
+    ADMIN_OVERRIDE_AVAILABLE = False
+    logging.warning("Admin override system not available")
+
+load_dotenv()
+
+class APIClient:
+    """
+    Client for interacting with LLM API endpoints (OpenAI or other).
+    Supports 'test' and 'judge' configurations.
+    """
+
+    def __init__(self, model_type=None, request_timeout=240, max_retries=3, retry_delay=5):
+        self.model_type = model_type or "default"
+
+        # Initialize CORE engine if available
+        self.use_core = CORE_AVAILABLE and os.getenv("USE_CORE_ENGINE", "true").lower() == "true"
+        if self.use_core:
+            # Configure CORE engine
+            cfg = EngineConfig(
+                backend="genai",  # Use native Google GenAI
+                api_key=os.getenv("GEMINI_API_KEY"),
+                use_vertex=os.getenv("USE_VERTEX", "false").lower() == "true",
+                project_id=os.getenv("GOOGLE_CLOUD_PROJECT"),
+                location=os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1"),
+                auto_cache_enabled=True,
+                auto_cache_token_threshold=6000,  # Cache large contexts
+                max_concurrency=16  # Reasonable concurrency for EQBench3
+            )
+            self.core_engine = Engine(cfg)
+            self.cache_index = CacheIndex("logs/eqbench3_cache.sqlite")
+            self.payload_cache = {}  # In-memory cache for payload deduplication
+
+            # Initialize admin override system
+            if ADMIN_OVERRIDE_AVAILABLE:
+                self.admin_manager = AdminOverrideManager()
+                self.batch_manager = BatchManager()
+                logging.info("Admin override system enabled for cost control")
+            else:
+                self.admin_manager = None
+                self.batch_manager = None
+                logging.warning("Admin override system not available")
+
+            logging.info(f"Initialized {self.model_type} API client with CORE engine")
+        else:
+            # Fallback to direct API calls
+            # Load specific or default API credentials based on model_type
+            if model_type == "test":
+                self.api_key = os.getenv("TEST_API_KEY", os.getenv("OPENAI_API_KEY"))
+                self.base_url = os.getenv("TEST_API_URL", os.getenv("OPENAI_API_URL", "https://api.openai.com/v1/chat/completions"))
+            elif model_type == "judge":
+                # Judge model is used for ELO pairwise comparisons
+                self.api_key = os.getenv("JUDGE_API_KEY", os.getenv("OPENAI_API_KEY"))
+                self.base_url = os.getenv("JUDGE_API_URL", os.getenv("OPENAI_API_URL", "https://api.openai.com/v1/chat/completions"))
+            else: # Default/fallback
+                self.api_key = os.getenv("OPENAI_API_KEY")
+                self.base_url = os.getenv("OPENAI_API_URL", "https://api.openai.com/v1/chat/completions")
+
+            self.request_timeout = int(os.getenv("REQUEST_TIMEOUT", request_timeout))
+            self.max_retries = int(os.getenv("MAX_RETRIES", max_retries))
+            self.retry_delay = int(os.getenv("RETRY_DELAY", retry_delay))
+
+            if not self.api_key:
+                logging.warning(f"API Key for model_type '{self.model_type}' not found in environment variables.")
+            self.headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}"
+            }
+
+            logging.debug(f"Initialized {self.model_type} API client with URL: {self.base_url}")
+
+    async def agenerate(self, model: str, messages: List[Dict[str, str]], temperature: float = 0.7, max_tokens: int = 4000, min_p: Optional[float] = 0.1) -> str:
+        """
+        Generic chat-completion style call using a list of messages.
+        Uses CORE engine with caching when available to avoid repeating identical payloads.
+        Falls back to direct API calls if CORE is not available.
+        """
+        # Create cache key from model and messages to avoid repeating identical requests
+        cache_key = hashlib.sha256(
+            json.dumps({"model": model, "messages": messages, "temperature": temperature, "max_tokens": max_tokens}, sort_keys=True).encode()
+        ).hexdigest()
+
+        # Check in-memory cache first
+        if cache_key in self.payload_cache:
+            logging.debug(f"Cache hit for payload {cache_key[:8]}...")
+            return self.payload_cache[cache_key]
+
+        if self.use_core:
+            # Use CORE engine with caching
+            try:
+                # Convert model name for CORE engine (handle different naming conventions)
+                core_model = self._convert_model_name(model)
+
+                # Admin override check for expensive operations
+                estimated_tokens = self._estimate_payload_tokens(messages, core_model)
+                if (self.admin_manager and
+                    not self.admin_manager.check_override_for_large_payload(core_model, estimated_tokens, f"eqbench3_{self.model_type}")):
+                    logging.warning(f"Admin override denied for {core_model} with {estimated_tokens} estimated tokens")
+                    # Fall through to OpenAI fallback instead
+                    raise Exception("Admin override required - falling back to OpenAI")
+
+                # Log the operation for audit
+                if self.admin_manager:
+                    self.admin_manager.log_operation(core_model, estimated_tokens, f"eqbench3_{self.model_type}", True)
+
+                # Call CORE engine
+                result = await self.core_engine.acomplete(
+                    messages=messages,
+                    model=core_model,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    metadata={"eqbench3_model_type": self.model_type}
+                )
+
+                content = result["text"]
+
+                # Strip thinking/reasoning blocks if present
+                content = self._clean_response(content)
+
+                # Cache the result
+                self.payload_cache[cache_key] = content
+                logging.debug(f"CORE engine call completed for {model}, cached as {cache_key[:8]}")
+
+                return content
+
+            except Exception as e:
+                logging.error(f"CORE engine call failed for {model}: {e}")
+                # Fall through to direct API call as backup
+
+        # Fallback to direct API calls (original logic)
+        if not hasattr(self, 'api_key') or not self.api_key:
+            raise ValueError(f"Cannot make API call for '{self.model_type}'. API Key is missing.")
+
+        for attempt in range(self.max_retries):
+            response = None
+            try:
+                payload = {
+                    "model": model,
+                    "messages": messages,
+                    "temperature": temperature,
+                    "max_tokens": max_tokens
+                }
+
+                # Apply min_p only for the test model if provided
+                if self.model_type == "test" and min_p is not None:
+                    payload['min_p'] = min_p
+                    logging.debug(f"Applying min_p={min_p} for test model call.")
+                elif self.model_type == "judge":
+                    pass  # Don't add min_p for judge
+
+                # Handle different API endpoints and model-specific requirements
+                self._adjust_payload_for_endpoint(payload, model)
+
+                response = requests.post(
+                    self.base_url,
+                    headers=self.headers,
+                    json=payload,
+                    timeout=self.request_timeout
+                )
+                response.raise_for_status()
+                data = response.json()
+
+                if not data.get("choices") or not data["choices"][0].get("message") or "content" not in data["choices"][0]["message"]:
+                    logging.warning(f"Unexpected API response structure on attempt {attempt+1}: {data}")
+                    raise ValueError("Invalid response structure received from API")
+
+                content = data["choices"][0]["message"]["content"]
+                content = self._clean_response(content)
+
+                # Cache the result
+                self.payload_cache[cache_key] = content
+                logging.debug(f"Direct API call completed for {model}, cached as {cache_key[:8]}")
+
+                return content
+
+            except requests.exceptions.Timeout:
+                logging.warning(f"Request timed out on attempt {attempt+1}/{self.max_retries} for model {model}")
+            except requests.exceptions.RequestException as e:
+                self._handle_request_error(e, response, attempt, model)
+            except json.JSONDecodeError:
+                logging.error(f"Failed to decode JSON response on attempt {attempt+1}/{self.max_retries} for model {model}.")
+                if response is not None:
+                    logging.error(f"Raw response text: {response.text}")
+            except Exception as e:
+                logging.error(f"Unexpected error during API call attempt {attempt+1}/{self.max_retries} for model {model}: {e}", exc_info=True)
+
+            if attempt < self.max_retries - 1:
+                time.sleep(self.retry_delay * (attempt + 1))
+
+        raise RuntimeError(f"Failed to generate text for model {model} after {self.max_retries} attempts")
+
+    def generate(self, model: str, messages: List[Dict[str, str]], temperature: float = 0.7, max_tokens: int = 4000, min_p: Optional[float] = 0.1) -> str:
+        """
+        Sync wrapper for CLI usage.
+        """
+        import asyncio
+        try:
+            asyncio.get_running_loop()
+            raise RuntimeError("generate() called inside running loop; use await agenerate() instead")
+        except RuntimeError:
+            pass  # no loop running, safe to use asyncio.run
+        return asyncio.run(self.agenerate(model, messages, temperature, max_tokens, min_p))
+
+    def _convert_model_name(self, model: str) -> str:
+        """Convert model names between different APIs."""
+        # Handle common model name mappings
+        if model.startswith("google/"):
+            return model.replace("google/", "")
+        elif model.startswith("openai/"):
+            return model.replace("openai/", "")
+        # Add more mappings as needed
+        return model
+
+    def _estimate_payload_tokens(self, messages: List[Dict[str, str]], model: str) -> int:
+        """Estimate token count for payload before making API call."""
+        if hasattr(self, 'core_engine'):
+            try:
+                # Use CORE engine's estimation for consistency
+                from core_gemini.caching import openai_messages_to_rest_contents, estimate_tokens
+                contents = openai_messages_to_rest_contents(messages)
+                estimated = estimate_tokens(self.core_engine.cfg, model=model, contents=contents)
+                return estimated or 1000  # fallback estimate
+            except Exception:
+                pass
+
+        # Fallback: rough character-based estimation (very approximate)
+        total_chars = sum(len(str(msg.get('content', ''))) for msg in messages)
+        return total_chars // 3  # Very rough approximation
+
+    def _clean_response(self, content: str) -> str:
+        """Clean response content by stripping thinking/reasoning blocks."""
+        if '<think>' in content and "</think>" in content:
+            post_think = content.find('</think>') + len("</think>")
+            content = content[post_think:].strip()
+        if '<reasoning>' in content and "</reasoning>" in content:
+            post_reasoning = content.find('</reasoning>') + len("</reasoning>")
+            content = content[post_reasoning:].strip()
+        return content
+
+    def _adjust_payload_for_endpoint(self, payload: Dict[str, Any], model: str) -> None:
+        """Adjust payload for specific API endpoints and model requirements."""
+        if self.base_url == 'https://api.openai.com/v1/chat/completions':
+            if 'min_p' in payload:
+                del payload['min_p']
+            if model == 'o3':
+                del payload['max_tokens']
+                payload['max_completion_tokens'] = payload.pop('max_tokens', 4000)
+                payload['temperature'] = 1
+            elif model in ['gpt-5-2025-08-07', 'gpt-5-mini-2025-08-07', 'gpt-5-nano-2025-08-07']:
+                payload['reasoning_effort'] = "minimal"
+                del payload['max_tokens']
+                payload['max_completion_tokens'] = payload.pop('max_tokens', 4000)
+                payload['temperature'] = 1
+            elif model in ['gpt-5-chat-latest']:
+                del payload['max_tokens']
+                payload['max_completion_tokens'] = payload.pop('max_tokens', 4000)
+                payload['temperature'] = 1
+
+        elif self.base_url == "https://openrouter.ai/api/v1/chat/completions":
+            if 'qwen3' in model.lower():
+                system_msg = [{"role": "system", "content": "/no_think"}]
+                payload['messages'] = system_msg + payload['messages']
+
+            if model == 'openai/o3':
+                payload["reasoning"] = {
+                    "effort": "low",
+                    "exclude": True
+                }
+
+    def _handle_request_error(self, e: Exception, response, attempt: int, model: str) -> None:
+        """Handle request errors with appropriate logging and retry logic."""
+        try:
+            logging.error(response.text)
+        except:
+            pass
+        logging.error(f"Request failed on attempt {attempt+1}/{self.max_retries} for model {model}: {e}")
+        if response is not None:
+            logging.error(f"Response status code: {response.status_code}")
+            try:
+                logging.error(f"Response body: {response.text}")
+            except Exception:
+                logging.error("Could not read response body.")
+
+            if response.status_code == 429:
+                logging.warning("Rate limit exceeded. Backing off...")
+                delay = self.retry_delay * (2 ** attempt) + random.uniform(0, 1)
+                logging.info(f"Retrying in {delay:.2f} seconds...")
+                time.sleep(delay)
+            elif response.status_code >= 500:
+                logging.warning(f"Server error ({response.status_code}). Retrying...")
+            else:
+                logging.warning("API error. Retrying...")
+# File: ai/eqbench3/utils/constants.py
+
+import os
+
+# Scenario ids that are not framed as role-play, i.e. they are a direct convo
+# between user & assistant
+NO_RP_SCENARIO_IDS = {
+    "8",
+    "10",
+    "12",
+    "14",
+    #"101","131","132","133","134","135","136","137","138","139","140","141","142","143","144","145","146"
+}
+
+MESSAGE_DRAFTING_SCENARIO_IDS = {
+    "201", "202", "203", "204", "205", "206", "207", "208", "209"
+}
+
+# --- NEW: Analysis Scenario IDs ---
+ANALYSIS_SCENARIO_IDS = {
+    "401", "402", "403", "404", "405", "406", "407", "408", "409", "410",
+    "411", "412", "413", "414", "415", "416", "417", "418", "419", "420",
+}
+
+# Character‑limits for the three parsed sections in a message‑drafting reply
+SECTION_CHAR_LIMITS_MESSAGE_DRAFT = {
+    "perspective_taking":   2200, # Updated key name
+    "draft_brainstorming": 1600, # Updated key name
+    "draft":      1600,
+}
+
+
+# Character limits for each parsed section (Role Play)
+SECTION_CHAR_LIMITS = {
+    "thinking_feeling": 2200,
+    "their_thinking_feeling": 1600,
+    "response": 1600
+}
+
+# Character limits for raw responses (NO_RP and ANALYSIS scenarios)
+RAW_RESPONSE_CHAR_LIMIT = 4000 # Used for NO_RP during judging, potentially for ANALYSIS too
+DEBRIEF_CHAR_LIMIT = 4000 # Used for standard/drafting debriefs
+ANALYSIS_RESPONSE_CHAR_LIMIT = 6000
+
+# --- Hardcoded File Paths ---
+DATA_DIR = "eqbench3/data"
+# Standard Task Files
+STANDARD_SCENARIO_PROMPTS_FILE = os.path.join(DATA_DIR, "scenario_prompts.txt")
+STANDARD_MASTER_PROMPT_FILE = os.path.join(DATA_DIR, "scenario_master_prompt.txt")
+STANDARD_DEBRIEF_PROMPT_FILE = os.path.join(DATA_DIR, "debrief_prompt.txt")
+STANDARD_RUBRIC_CRITERIA_FILE = os.path.join(DATA_DIR, "rubric_scoring_criteria.txt")
+STANDARD_RUBRIC_PROMPT_FILE = os.path.join(DATA_DIR, "rubric_scoring_prompt.txt")
+STANDARD_PAIRWISE_PROMPT_FILE = os.path.join(DATA_DIR, "pairwise_prompt_eqbench3.txt")
+STANDARD_SCENARIO_NOTES_FILE = os.path.join(DATA_DIR, "scenario_notes.txt") # Assuming notes apply generally
+# Message Drafting Task Files
+MESSAGE_DRAFTING_MASTER_PROMPT_FILE = os.path.join(DATA_DIR, "scenario_master_prompt_message_drafting.txt")
+# Analysis Task Files
+ANALYSIS_MASTER_PROMPT_FILE = os.path.join(DATA_DIR, "scenario_master_prompt_analysis.txt")
+ANALYSIS_RUBRIC_CRITERIA_FILE = os.path.join(DATA_DIR, "rubric_scoring_criteria_analysis.txt")
+ANALYSIS_RUBRIC_PROMPT_FILE = os.path.join(DATA_DIR, "rubric_scoring_prompt_analysis.txt")
+ANALYSIS_PAIRWISE_PROMPT_FILE = os.path.join(DATA_DIR, "pairwise_prompt_eqbench3_analysis.txt")
+ANALYSIS_SCENARIO_NOTES_FILE = os.path.join(DATA_DIR, "scenario_notes.txt")
+
+# --- NEW: Canonical Leaderboard File Paths ---
+CANONICAL_LEADERBOARD_RUNS_FILE = os.path.join(DATA_DIR, "canonical_leaderboard_results.json.gz")
+CANONICAL_LEADERBOARD_ELO_FILE = os.path.join(DATA_DIR, "canonical_leaderboard_elo_results.json.gz")
+
+# --- Default Local File Paths (used in argparse defaults) ---
+DEFAULT_LOCAL_RUNS_FILE = "eqbench3_runs.json"
+DEFAULT_LOCAL_ELO_FILE = "elo_results_eqbench3.json"
+
+
+MODEL_NAME_SUBS = {
+    'deepseek/deepseek-r1': 'deepseek-ai/DeepSeek-R1',
+    'deepseek/deepseek-chat-v3-0324': 'deepseek-ai/DeepSeek-V3-0324',
+    'anthropic/claude-3.5-sonnet': 'claude-3-5-sonnet-20241022',
+    'chatgpt-4o-latest': 'chatgpt-4o-latest-2025-04-25',
+    'anthropic/claude-3.7-sonnet': 'claude-3-7-sonnet-20250219',
+    'openai/gpt-4.5-preview': 'gpt-4.5-preview',
+    'cohere/command-a': 'CohereForAI/c4ai-command-a-03-2025',
+    'anthropic/claude-3.5-haiku': 'claude-3-5-haiku-20241022',
+    'google/gemini-2.0-flash-001': 'gemini-2.0-flash',
+    'openai/gpt-4o-mini': 'gpt-4o-mini',
+    'mistralai/mistral-nemo': 'mistralai/Mistral-Nemo-Instruct-2407',
+    'mistralai/mistral-small-3.1-24b-instruct': 'mistralai/Mistral-Small-3.1-24B-Instruct-2503',
+    'mistralai/mistral-small-24b-instruct-2501': 'mistralai/Mistral-Small-24B-Instruct-2501',
+    'mistralai/ministral-3b': 'ministral-3b',
+    'openai/chatgpt-4o-latest': 'chatgpt-4o-latest-2025-03-27',
+    'rekaai/reka-flash-3:free': 'RekaAI/reka-flash-3',
+    'google/gemini-2.5-pro-preview-03-25': 'gemini-2.5-pro-preview-03-25',
+    'openrouter/quasar-alpha': 'quasar-alpha',
+    'openrouter/optimus-alpha': 'optimus-alpha',
+    'meta-llama/llama-4-scout': 'meta-llama/Llama-4-Scout-17B-16E-Instruct',
+    'meta-llama/llama-4-maverick': 'meta-llama/Llama-4-Maverick-17B-128E-Instruct',
+    'x-ai/grok-3-beta': 'grok-3-beta',
+    'x-ai/grok-3-mini-beta': 'grok-3-mini-beta',
+    'mistralai/pixtral-large-2411':'mistralai/Pixtral-Large-Instruct-2411',
+    'openai/gpt-4.1-mini': 'gpt-4.1-mini',
+    'openai/gpt-4.1': 'gpt-4.1',
+    'openai/gpt-4.1-nano': 'gpt-4.1-nano',
+    'google/gemini-2.5-flash-preview': 'gemini-2.5-flash-preview',
+    'google/gemini-2.5-pro': 'gemini-2.5-pro',
+    'anthropic/claude-opus-4': 'claude-opus-4',
+    'mistralai/mistral-small-3.2-24b-instruct': 'mistralai/Mistral-Small-3.2-24B-Instruct-2506',
+}
+# File: ai/eqbench3/utils/file_io.py
+
+import os
+import json
+import logging
+import threading
+from typing import Dict, Any
+import time
+import gzip # Added for gzip support
+
+_file_locks = {}
+_file_locks_lock = threading.RLock()
+
+def get_file_lock(file_path: str) -> threading.RLock:
+    """
+    Acquire or create a per-file lock to avoid concurrent writes.
+    """
+    # This function should now only be called with valid string paths.
+    # The check for None should happen in the calling function (load_json_file).
+    with _file_locks_lock:
+        # Normalize path for consistent locking, especially with .gz
+        normalized_path = os.path.normpath(file_path)
+        if normalized_path not in _file_locks:
+            _file_locks[normalized_path] = threading.RLock()
+        return _file_locks[normalized_path]
+
+def load_json_file(file_path: str) -> dict:
+    """
+    Thread-safe read of a JSON file (plain or gzipped), returning an empty dict
+    if not found or error. Detects gzip based on '.gz' extension.
+    Handles file_path being None by returning an empty dict immediately.
+    """
+    if file_path is None:
+        logging.debug("File path is None, returning empty dict.")
+        return {}
+
+    lock = get_file_lock(file_path)
+    with lock:
+        if not os.path.exists(file_path):
+            logging.debug(f"File not found: {file_path}, returning empty dict.")
+            return {}
+
+        open_func = gzip.open if file_path.endswith(".gz") else open
+        mode = 'rt' if file_path.endswith(".gz") else 'r'
+        encoding = 'utf-8' # Consistent encoding
+
+        try:
+            with open_func(file_path, mode=mode, encoding=encoding) as f:
+                content = f.read()
+                if not content.strip(): # Handle empty file
+                    logging.warning(f"File is empty: {file_path}, returning empty dict.")
+                    return {}
+                return json.loads(content)
+        except json.JSONDecodeError as e:
+            logging.error(f"Invalid JSON in {file_path}: {e}. Returning empty dict.")
+            # Optional: backup corrupted file (consider if needed for .gz)
+            return {}
+        except gzip.BadGzipFile as e:
+            logging.error(f"Bad Gzip file error reading {file_path}: {e}. Returning empty dict.")
+            return {}
+        except Exception as e:
+            logging.error(f"Error reading {file_path}: {e}", exc_info=True)
+            return {}
+        
+def _make_temp_path(file_path: str) -> str:
+    """
+    Derive a temporary filename that preserves a trailing '.gz' so the gzip
+    handle is closed *before* we rename.  Examples:
+        foo.json           -> foo.json.tmp
+        bar/baz.json.gz    -> bar/baz.json.tmp.gz
+    """
+    if file_path.endswith(".gz"):
+        return f"{file_path[:-3]}.tmp.gz"   # insert .tmp *before* .gz
+    return f"{file_path}.tmp"
+
+
+def _atomic_write_json(data: Dict[str, Any], file_path: str):
+    """
+    Atomically write *data* as JSON to *file_path*.
+
+    For .gz targets we set the header filename so the archive contains
+    the *final* `.json` name even if we're writing to a temp file.
+    """
+    temp_path = _make_temp_path(file_path)
+    is_gz     = file_path.endswith(".gz")
+
+    try:
+        if is_gz:
+            # -------------------------------------------------------------
+            # Derive the intended header name:
+            #   foo.tmp.<uuid>.json.gz  ->  foo.json
+            #   canonical_leaderboard_results.json.gz  -> same minus .gz
+            #
+            base_no_gz = os.path.basename(file_path[:-3])  # strip '.gz'
+            if ".tmp." in base_no_gz:
+                stem, ext = os.path.splitext(base_no_gz)   # stem may still have .tmp.<uuid>
+                stem = stem.split(".tmp.", 1)[0]           # drop tmp token
+                header_name = stem + ext                   # e.g. foo.json
+            else:
+                header_name = base_no_gz                   # already fine
+
+            json_bytes = json.dumps(data, indent=2,
+                                     ensure_ascii=False).encode("utf-8")
+
+            with open(temp_path, "wb") as raw:
+                with gzip.GzipFile(
+                    filename=header_name,  # correct header
+                    mode="wb",
+                    fileobj=raw,
+                ) as gz:
+                    gz.write(json_bytes)
+        else:
+            with open(temp_path, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=2, ensure_ascii=False)
+
+        os.replace(temp_path, file_path)  # atomic replace
+    except Exception as e:
+        logging.error(f"Atomic write failed for {file_path}: {e}")
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        except OSError:
+            pass
+        raise
+
+
+
+
+def save_json_file(data: Dict[str, Any], file_path: str, max_retries: int = 3, retry_delay: float = 0.5) -> bool:
+    """
+    Thread-safe function to save dictionary data to a JSON file (plain or gzipped)
+    using atomic write. Includes retry logic. Detects gzip based on '.gz' extension.
+    """
+    if file_path is None: # Should not happen if called correctly, but good safeguard
+        logging.error("save_json_file called with None file_path. Cannot save.")
+        return False
+
+    lock = get_file_lock(file_path)
+    for attempt in range(max_retries):
+        if attempt > 0:
+            logging.warning(f"Retrying save to {file_path} (attempt {attempt+1}/{max_retries})...")
+            time.sleep(retry_delay * (1.5 ** attempt)) # Exponential backoff
+
+        # Acquire lock inside the loop for each attempt
+        with lock:
+            try:
+                # Ensure parent directory exists
+                dir_name = os.path.dirname(file_path)
+                if dir_name: # Check if dirname is not empty
+                    os.makedirs(dir_name, exist_ok=True)
+
+                _atomic_write_json(data, file_path)
+                logging.debug(f"Successfully wrote JSON to {file_path} on attempt {attempt+1}")
+                return True
+            except Exception as e:
+                logging.error(f"save_json_file() attempt {attempt+1} failed for {file_path}: {e}", exc_info=True)
+                # Continue to next retry attempt
+
+    logging.error(f"Failed to save JSON to {file_path} after {max_retries} attempts.")
+    return False
+
+
+def update_run_data(runs_file: str, run_key: str, update_dict: Dict[str, Any],
+                    max_retries: int = 3, retry_delay: float = 0.5) -> bool:
+    """
+    Thread-safe function to MERGE partial run data into the existing run file
+    (plain or gzipped). Handles nested merging for 'scenario_tasks'.
+    Detects gzip based on '.gz' extension.
+    """
+    if runs_file is None: # Should not happen if called correctly
+        logging.error(f"update_run_data called with None runs_file for run_key {run_key}. Cannot update.")
+        return False
+
+    lock = get_file_lock(runs_file)
+    for attempt in range(max_retries):
+        if attempt > 0:
+            logging.warning(f"Retrying update_run_data for {run_key} in {runs_file} (attempt {attempt+1}/{max_retries})...")
+            time.sleep(retry_delay * (1.5 ** attempt)) # Exponential backoff
+
+        # Acquire lock inside the loop for each attempt
+        with lock:
+            current_runs = {} # Initialize as empty dict
+            try:
+                # Load existing data within the lock (handles gzip)
+                current_runs = load_json_file(runs_file) # Use the updated load function
+
+                if not isinstance(current_runs, dict):
+                    logging.warning(f"Run file {runs_file} content is not a dictionary or load failed. Resetting to empty dict.")
+                    current_runs = {}
+
+                # Ensure the run key exists
+                if run_key not in current_runs:
+                    current_runs[run_key] = {}
+
+                # --- Merge Logic (remains the same) ---
+                run_data_to_update = current_runs[run_key]
+
+                for top_key, new_val in update_dict.items():
+                    if top_key == "scenario_tasks":
+                        if top_key not in run_data_to_update:
+                            run_data_to_update[top_key] = {}
+                        if not isinstance(run_data_to_update[top_key], dict):
+                             logging.warning(f"Overwriting non-dict '{top_key}' in {run_key} with new dict.")
+                             run_data_to_update[top_key] = {}
+
+                        if isinstance(new_val, dict):
+                            for iteration_idx, scenario_map in new_val.items():
+                                if iteration_idx not in run_data_to_update[top_key]:
+                                    run_data_to_update[top_key][iteration_idx] = {}
+                                if not isinstance(run_data_to_update[top_key][iteration_idx], dict):
+                                     logging.warning(f"Overwriting non-dict iteration '{iteration_idx}' in {run_key}/{top_key} with new dict.")
+                                     run_data_to_update[top_key][iteration_idx] = {}
+
+                                if isinstance(scenario_map, dict):
+                                    for s_id, s_data in scenario_map.items():
+                                        run_data_to_update[top_key][iteration_idx][s_id] = s_data
+                                else:
+                                    logging.warning(f"Received non-dict data for iteration '{iteration_idx}' in {run_key}/{top_key}. Overwriting.")
+                                    run_data_to_update[top_key][iteration_idx] = scenario_map
+                        else:
+                             logging.warning(f"Received non-dict data for '{top_key}' in {run_key}. Overwriting.")
+                             run_data_to_update[top_key] = new_val
+
+                    elif top_key in ["results", "elo_analysis"]:
+                        if top_key not in run_data_to_update:
+                            run_data_to_update[top_key] = {}
+                        if isinstance(new_val, dict) and isinstance(run_data_to_update[top_key], dict):
+                            run_data_to_update[top_key].update(new_val)
+                        else:
+                            run_data_to_update[top_key] = new_val
+
+                    else:
+                        run_data_to_update[top_key] = new_val
+                # --- End Merge Logic ---
+
+                # Now write the modified current_runs back to the file (handles gzip)
+                # Ensure parent directory exists before writing
+                dir_name = os.path.dirname(runs_file)
+                if dir_name:
+                    os.makedirs(dir_name, exist_ok=True)
+
+                _atomic_write_json(current_runs, runs_file)
+                logging.debug(f"Successfully updated run_key={run_key} in {runs_file} on attempt {attempt+1}")
+                return True # Success
+
+            except (IOError, gzip.BadGzipFile) as e: # Added BadGzipFile
+                logging.error(f"Error reading/writing run file {runs_file} on attempt {attempt+1}: {e}. Aborting update for this attempt.")
+                # Don't return False immediately, allow retry
+            except Exception as e:
+                logging.error(f"Error during update_run_data attempt {attempt+1} for {run_key} in {runs_file}: {e}", exc_info=True)
+                # Don't return False immediately, allow retry
+
+    # If loop finishes, all retries failed
+    logging.error(f"update_run_data failed for {run_key} in {runs_file} after {max_retries} attempts.")
+    return Falseimport os
+import logging
+
+def setup_logging(verbosity: str):
+    log_levels = {
+        'DEBUG': logging.DEBUG,
+        'INFO': logging.INFO,
+        'WARNING': logging.WARNING,
+        'ERROR': logging.ERROR,
+        'CRITICAL': logging.CRITICAL
+    }
+    log_level = log_levels.get(verbosity.upper(), logging.INFO)
+    # Ensure logs directory exists
+    log_dir = "logs"
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, "eqbench3.log")
+
+    # Remove existing handlers to avoid duplicate logs if called multiple times
+    for handler in logging.root.handlers[:]:
+        logging.root.removeHandler(handler)
+
+    logging.basicConfig(
+        level=log_level,
+        format='%(asctime)s - %(levelname)s - [%(threadName)s] - %(filename)s:%(lineno)d - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+        handlers=[
+            logging.FileHandler(log_file, encoding='utf-8'),
+            logging.StreamHandler() # Also log to console
+        ]
+    )
+    logging.info(f"Logging setup complete. Level: {verbosity.upper()}. Log file: {log_file}")
+
+
+def get_verbosity(args_verbosity: str) -> str:
+    """Gets verbosity level from args or environment variable."""
+    env_verbosity = os.getenv("LOG_VERBOSITY", "INFO")
+    # Command-line argument takes precedence
+    return args_verbosity if args_verbosity else env_verbosityimport json
+from typing import Any, Dict
+
+
+def robust_json_loads(raw_text: str) -> Dict[str, Any]:
+    """
+    Parse a JSON object embedded in judge output that may contain:
+      • multiple ```json fenced blocks       → keep only the last
+      • fence markers (``` or ```json)       → strip them
+      • unescaped newlines inside strings    → repair
+      • stray double-quotes inside strings   → repair
+
+    Returns the decoded object or raises JSONDecodeError.
+    """
+
+    # ────────────────────  stage 1: isolate last ```json block  ────────────────────
+    if raw_text.count("```json") > 1:
+        raw_text = raw_text[raw_text.rfind("```json") + len("```json"):]
+
+    # ────────────────────  stage 2: drop any fence lines  ────────────────────
+    cleaned = "\n".join(
+        line for line in raw_text.splitlines()
+        if not line.lstrip().startswith("```")
+    ).strip()
+
+    # ────────────────────  stage 3: extract the first balanced JSON object  ────────────────────
+    def extract_first_json(s: str) -> str | None:
+        in_string = False
+        escape_next = False
+        depth = 0
+        start = None
+
+        for i, ch in enumerate(s):
+            if in_string:
+                if escape_next:
+                    escape_next = False
+                elif ch == "\\":
+                    escape_next = True
+                elif ch == '"':
+                    in_string = False
+            else:
+                if ch == '"':
+                    in_string = True
+                elif ch == "{":
+                    if depth == 0:
+                        start = i
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0 and start is not None:
+                        return s[start : i + 1]
+        return None
+
+    json_str = extract_first_json(cleaned)
+    if json_str is None:
+        raise json.JSONDecodeError("No balanced JSON object found", cleaned, 0)
+
+    # ────────────────────  stage 4: quick parse  ────────────────────
+    try:
+        return json.loads(json_str)
+    except json.JSONDecodeError:
+        pass  # fall through to repair passes
+
+    # ────────────────────  stage 5a: repair unescaped newlines  ────────────────────
+    def repair_newlines(s: str) -> str:
+        out, in_string, esc = [], False, False
+        for ch in s:
+            if in_string:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_string = False
+                elif ch in "\r\n":
+                    ch = "\\n"
+            else:
+                if ch == '"':
+                    in_string = True
+            out.append(ch)
+        return "".join(out)
+
+    fixed = repair_newlines(json_str)
+
+    # ────────────────────  stage 5b: repair stray inner quotes  ────────────────────
+    def repair_inner_quotes(s: str) -> str:
+        out, in_string, esc = [], False, False
+        i, n = 0, len(s)
+        while i < n:
+            ch = s[i]
+            if in_string:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    # peek ahead for illegal terminator
+                    j = i + 1
+                    while j < n and s[j].isspace():
+                        j += 1
+                    if j < n and s[j] not in {",", "}", "]", ":"}:
+                        out.append("\\")  # escape
+                    else:
+                        in_string = False
+            else:
+                if ch == '"':
+                    in_string = True
+            out.append(ch)
+            i += 1
+        return "".join(out)
+
+    fixed = repair_inner_quotes(fixed)
+
+    # ────────────────────  stage 6: final parse  ────────────────────
+    return json.loads(fixed)
